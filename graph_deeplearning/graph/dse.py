@@ -3,59 +3,19 @@ import logging
 from enum import Enum
 from typing import NamedTuple, Union, Dict, List, Iterable, Generator
 from pyhocon import ConfigFactory, ConfigTree
+import numpy as np
 
-from utils import GraphConfig, select
-from schema import Person, Company, Review, Vertex, Edge, graph_schema, GraphSchemaId
-
-from dse.auth import PlainTextAuthProvider
-from dse.cluster import Cluster, GraphExecutionProfile, EXEC_PROFILE_GRAPH_DEFAULT
-from dse.cluster import GraphOptions
-from dse.policies import AddressTranslator
-from dse.graph import SimpleGraphStatement
+from graph_deeplearning.utilities import select
+from graph_deeplearning.utilities.connection import CqlClient, DseClient, Connection, CassandraEnvironment
+from graph_deeplearning.schema import graph_schema, GraphSchemaId
+from graph_deeplearning.graph import GraphConfig, GraphMode, EdgeError, VertexError, Person, Company, Review, Vertex, Edge
+  
+from dse.cluster import GraphExecutionProfile, GraphOptions, EXEC_PROFILE_GRAPH_DEFAULT
+from dse.policies import RoundRobinPolicy
 
 logging.basicConfig(format='%(asctime)s %(name)s %(levelname)s %(message)s', level=logging.WARN)
 log = logging.getLogger('python_shared-agent:dse')
 log.setLevel(30)  # Set logging level to WARN
-
-
-class AddressTranslate(AddressTranslator):
-    def __init__(self, address_translation: dict):
-        self.address_translation = address_translation
-
-    def translate(self, addr: str) -> str:
-        if addr in self.address_translation:
-            return self.address_translation.get(addr)
-        else:
-            return addr
-
-
-def dse_get_session(username: str, password: str, cluster_ip: list, address_dict: dict = None, graph_name: str=None):
-    if address_dict is not None:
-        address_translator = AddressTranslate(address_dict)
-    else:
-        address_translator = None
-
-    if username is None or password is None:
-        raise ValueError('\033[91m[ERROR] Authentication not provided')
-
-    auth_provider = PlainTextAuthProvider(
-        username=username, password=password)
-    cluster = None
-    if graph_name is None:
-        cluster = Cluster(cluster_ip,
-                          address_translator=address_translator,
-                          auth_provider=auth_provider)
-    else:
-        ep = GraphExecutionProfile(graph_options=GraphOptions(graph_name=graph_name))
-        cluster = Cluster(cluster_ip,
-                          address_translator=address_translator,
-                          auth_provider=auth_provider,
-                          execution_profiles={EXEC_PROFILE_GRAPH_DEFAULT: ep})
-
-    if cluster is not None:
-        return cluster.connect()
-    else:
-        return None
 
 
 class DsePropertyType(Enum):
@@ -68,32 +28,6 @@ class DsePropertyType(Enum):
     Point = 5
     PointWithGeoBounds = 6
     Timestamp = 7
-
-
-class VertexError(TypeError):
-    """Exception thrown when invalid vertex object is given as argument."""
-
-    def __init__(self, value, types=None):
-        if types:
-            super().__init__("Graph vertices must be of type in {expected}, got '{actual}' instead".format(
-                expected=repr([cls.__name__ for cls in types]),
-                actual=type(value).__name__
-            ))
-        else:
-            super().__init__("Invalid graph vertex type: {}".format(type(value).__name__))
-
-
-class EdgeError(TypeError):
-    """Exception thrown when invalid edge object is given as argument."""
-
-    def __init__(self, value, types=None):
-        if types:
-            super().__init__("Graph edges must be of type in {expected}, got '{actual}' instead".format(
-                expected=repr([cls.__name__ for cls in types]),
-                actual=type(value).__name__
-            ))
-        else:
-            super().__init__("Invalid graph edge type: {}".format(type(value).__name__))
 
 
 class DseGraphProperty(object):
@@ -123,19 +57,14 @@ class DseGraphProperty(object):
                     multiplicity="multiple" if self.multiple else "single"
                 ) + (".ifNotExists()" if exist_ok else "") + ".create()"    
 
+# -------------------------------------------------------------------------------------------------
+# Person, Company, and Review named tuples
+Person = NamedTuple('Person', [('name', str), ('gender', str), ('age', int), ('preferences', np.ndarray)])
+Company = NamedTuple('Company', [('name', str), ('styles', np.ndarray)])
+Review = NamedTuple('Review', [('name', str), ('company', 'str'), ('score', float)])
 
-class CassandraEnvironment(Enum):
-    """Which cassandra environment to use"""
-    PROD = "PROD"
-    DEV = "DEV"
-
-
-class GraphMode(Enum):
-    """Mode in which to open graph connection."""
-
-    READ_WRITE = "rw"
-    READ = "r"
-    APPEND = "a"
+# -------------------------------------------------------------------------------------------------
+# Logging
 
 
 class DseConfig(GraphConfig):
@@ -150,8 +79,6 @@ class DseConfig(GraphConfig):
         "username",    # Database user name.
         "password",    # Database user password.
         "keyspace",    # Cassandra keyspace.
-        "consumer",    # IP of bootstrap server of Kafka producer.
-        "dse_config"   # Configuration of DSE backend.
     )
 
     def __init__(self, config: ConfigTree=None, group: str=None,
@@ -174,7 +101,6 @@ class DseConfig(GraphConfig):
         self.password = select(password, self.password)
         self.keyspace = select(keyspace, self.keyspace)
         self.graph_name = select(graph_name, self.graph_name)
-        self.dse_config = DseConfig.default().copy()
 
 
     def __getattr__(self, key: str) -> object:
@@ -201,9 +127,6 @@ class DseConfig(GraphConfig):
         self.graph_name = self._get_string(
             config=config, group=group, key=["graph_name", "graph"], default=self.graph_name, inherit=True
         )
-        self.consumer = self._get_string(
-            config=config, group=group, key=["consumer", "broker"], default=self.consumer
-        )
 
     def update(self, config: ConfigTree, group: str=None):
         """Update configuration entries from given ConfigTree."""
@@ -219,37 +142,32 @@ class DseConfig(GraphConfig):
         return addr_dict
 
 
-class DseGraph(object):
-    """Geo-image graph stored in DSE graph database."""
+class DseGraph(DseClient):
+    """Client functions for DSE graph database powered by Cassandra."""
 
-    def __init__(self, name: str, mode: Union[GraphMode, str]=None,
-                 config: DseConfig=None, schema: GraphSchemaId=None, logger=None):
-        """Initialize DSE geo-image graph interface.
-
-        Args:
-            name: Name of graph. When client is not ``None``, this attribute is overridden by the name of
-                  the graph that this ``client`` is connected to, i.e., this argument is ignored in this case.
-            mode: Mode in which to open graph connection.
-            config: DSE Config. Default configuration used if ``None``.
-            schema: ID of graph schema to use. If ``None``, select based on graph ``name`` or assume default.
-            logger: Logger used for debug, status, and other messages.
-        """
-        self.name = name
-        self.logger = logging.getLogger("graph") if logger is None else logger
-        self.mode = mode
-        if schema is None:
-            if self.name == "v2019a":
-                schema = GraphSchemaId.v2019a
-            else:
-                schema = GraphSchemaId.DEFAULT
-        config=DseConfig.default().dse_config if not config else config
-        self.client = dse_get_session(username=config.username,
-                                      password=config.password,
-                                      cluster_ip=config.cluster_ip
-                                    )                                    
-        self.schema = graph_schema(schema)
-        self.logger.debug("Using graph schema '%s'", self.schema.uid().value)
-        self._queries = {}
+    def __init__(self, config: DseConfig=None, graph_name: str=None, keyspace: str=None, logger=None):
+        """Initialize graph database client."""
+        if logger is None:
+            logger = logging.getLogger("graph.dse")
+            logger.setLevel(logging.WARNING)
+        config = select(config, DseConfig.default()).copy()
+        if graph_name is not None:
+            config.graph_name = graph_name
+        if not config.graph_name:
+            raise ValueError("A graph name must be specified, either via the 'config' or 'graph_name' argument")
+        super().__init__(
+            config=config,
+            keyspace=select(keyspace, ""),
+            profiles={
+                EXEC_PROFILE_GRAPH_DEFAULT: GraphExecutionProfile(
+                    request_timeout=120.0,
+                    load_balancing_policy=RoundRobinPolicy(),
+                    graph_options=GraphOptions(graph_name=config.graph_name)
+                )
+            },
+            logger=logger
+        )
+        self.graph_name = config.graph_name
 
     @classmethod
     def _vertex_types(cls):
@@ -555,4 +473,3 @@ class DseGraph(object):
                 break
             count += num_results
         return count
-

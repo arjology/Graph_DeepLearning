@@ -8,6 +8,24 @@ from copy import copy as make_copy
 import numpy as np
 
 # -------------------------------------------------------------------------------------------------
+# Logging
+
+def to_log_level(level: Union[str, int]):
+    """Get logging level from log_level argument."""
+    try:
+        level = int(level)
+    except ValueError:
+        log_levels = ("CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "DEBUG", "INFO")
+        if level.upper() not in log_levels:
+            raise ValueError("Invalid logging level, must be either integer or one of {}".format(log_levels))
+    return level
+
+
+def get_log_level(config):
+    """Get logging level from parsed module configuration."""
+    return to_log_level(config.get_string("logging.level"))
+
+# -------------------------------------------------------------------------------------------------
 # Command argument parsing
 
 ARG_CHOICES_TRUE = "true", "t", "yes", "y", "on", "1"
@@ -21,6 +39,9 @@ def arg_to_bool(arg: Union[bool, str]) -> bool:
         return arg
     return arg.lower() in ARG_CHOICES_TRUE
 
+def camelcase_to_lowercase(arg: str) -> str:
+    """Convert class name in upper camel case to lowercase with underscores as word delimiters."""
+    return re.sub(r'(.)([A-Z])', '\\1_\\2', arg).lower()
 
 # -------------------------------------------------------------------------------------------------
 # Optional map
@@ -113,6 +134,9 @@ class DataStore(Enum):
             raise TypeError("Invalid database/storage backend")
         return backend
 
+
+# -------------------------------------------------------------------------------------------------
+# Configuration classes
 
 class BaseConfig(object):
     """Base class of module configurations."""
@@ -334,49 +358,3 @@ class BaseConfig(object):
                 return False
         return True    
 
-
-class GraphConfig(BaseConfig):
-    """Configuration of graph database."""
-
-    """Configuration of geo-image graph."""
-
-    GROUP = "geoimage"
-
-    __slots__ = [
-        "backend",     # Default backend used for geo-image graph storage.
-        "graph_name",  # Default name of geo-image graph.
-    ]
-
-    def __init__(self, config: ConfigTree=None, group: str=None,
-                 backend: DataStore=None, graph_name: str=None,
-                 log_level: Union[int, str]=None, verbosity: int=None):
-        """Set configuration of geo-image graph interface."""
-        super().__init__(config=config, group=group, log_level=log_level, verbosity=verbosity)
-        self.backend = select(backend, self.backend)
-        self.graph_name = select(graph_name, self.graph_name)
-
-# -------------------------------------------------------------------------------------------------
-# Person, Company, and Review named tuples
-Person = NamedTuple('Person', [('name', str), ('gender', str), ('age', int), ('preferences', np.ndarray)])
-Company = NamedTuple('Company', [('name', str), ('styles', np.ndarray)])
-Review = NamedTuple('Review', [('name', str), ('company', 'str'), ('score', float)])
-
-# -------------------------------------------------------------------------------------------------
-# Logging
-
-
-def to_log_level(level: Union[str, int]):
-    """Get logging level from log_level argument."""
-    try:
-        level = int(level)
-    except ValueError:
-        log_levels = ("CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "DEBUG", "INFO")
-        if level.upper() not in log_levels:
-            raise ValueError("Invalid logging level, must be either integer or one of {}".format(log_levels))
-    return level
-
-
-def get_log_level(config):
-    """Get logging level from parsed module configuration."""
-    return to_log_level(config.get_string("logging.level"))
-    

@@ -1,9 +1,11 @@
 from enum import Enum
 from typing import Iterable
 
-from utils import optmap
-from graph import DseGraphProperty, DsePropertyType
-from schema import Person, Company, Review, GraphElement, GraphSchemaId
+from graph_deeplearning.utilities import optmap
+from graph_deeplearning.graph import Person, Company, Review, GraphElement
+from graph_deeplearning.graph.dse import DseGraphProperty, DsePropertyType
+from graph_deeplearning.schema import GraphSchema, GraphSchemaId
+
 
 class PERSON_FIELDS(Enum):
     """Enumeration of Person fields"""
