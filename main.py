@@ -6,16 +6,18 @@ import argparse
 import pandas as pd
 import logging
 
+
+
 from graph_deeplearning.data import DataMaker
-from graph_deeplearning.utilities import optmap, select
-from graph_deeplearning.graph import Person, Company, Review
+from graph_deeplearning.utilities import optmap, select, PathType
+from graph_deeplearning.schema import Person, Company, Review
 
 
 def main(argv=None):
 
     LOG_FORMAT = '%(asctime)s %(name)s %(levelname)s %(message)s'
     LOG_LEVEL = logging.DEBUG
-    logger = logging.getLogger("DataMaker")
+    logger = logging.getLogger("graph_deeplearning")
     handler = logging.StreamHandler()
     formatter = logging.Formatter(LOG_FORMAT)
     handler.setFormatter(formatter)
@@ -30,7 +32,15 @@ def main(argv=None):
     parser.add_argument('--plot', dest="plot", type=bool)
     parser.add_argument('--save', dest="save", type=bool)
     parser.add_argument('--load', dest="load", type=bool)
+    parser.add_argument('--conf', dest="conf", type=PathType(exists=True, type='file'))
     args = parser.parse_args()
+
+    print("Configuration [{}]: {}".format(type(args.conf), args.conf))
+    if args.conf:
+        from pyhocon import ConfigFactory
+        config = ConfigFactory.parse_file(conf)
+    else:
+        from graph_deeplearning.utilities import DEFAULT_CONFIG as config
 
     N_people = select(args.N_people, 250)
     N_companies = select(args.N_companies, 50)
@@ -60,7 +70,14 @@ def main(argv=None):
     save = select(args.save, False)
     load = select(args.load, False)
 
-    data_maker = DataMaker(N_people, N_companies, N_reviews_per_person, N_styles, logger.getChild("DataMaker"))
+    data_maker = DataMaker(
+        N_people=N_people,
+        N_companies=N_companies,
+        N_reviews_per_person=N_reviews_per_person,
+        N_styles=N_styles,
+        logger=logger.getChild("DataMaker"),
+        config=config
+    )
     data_maker.generate_companies()
     data_maker.generate_people_and_reviews()
 

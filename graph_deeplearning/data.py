@@ -3,13 +3,44 @@ import random
 import pandas as pd
 import numpy as np
 from faker import Faker
+from progressbar import ProgressBar
+from pyhocon import ConfigTree
+from logging import Logger
 
-from graph_deeplearning.graph import GraphMode, Person, Company, Review
-from graph_deeplearning.graph.dse import DseGraph
+from typing import List
+
+from graph_deeplearning.schema import Person, Company, Review
+from graph_deeplearning.schema import add_company_query, add_person_query, add_review_query,\
+    create_graph, create_schema
+from graph_deeplearning.utilities.connection import dse_get_session
 
 class DataMaker:
 
-    def __init__(self, N_people, N_companies, N_reviews_per_person, N_styles, logger):
+    def __init__(self,
+        N_people: int=None, 
+        N_companies: int=None,
+        N_reviews_per_person: int=None, 
+        N_styles: int=None, 
+        config: ConfigTree=None,
+        logger: Logger=None
+        ):
+
+        if config is None:
+            from graph_deeplearning.utilities import DEFAULT_CONFIG as config
+        self.config = config
+
+        if logger is None:
+                import logging
+                LOG_FORMAT = '%(asctime)s %(name)s %(levelname)s %(message)s'
+                LOG_LEVEL = logging.DEBUG
+                self.logger = logging.getLogger("DataMaker")
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter(LOG_FORMAT)
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+                self.logger.setLevel(config['default']['log_level'])
+        else:
+            self.logger = logger
 
         self.fake = Faker()
         self.logger = logger
@@ -28,7 +59,7 @@ class DataMaker:
         self.company_names = set()
 
         # Instantiate attributes ages, genders, and features
-        self.ages = np.random.randint(low=18, high=70, size=self.N_people)
+        self.ages = np.random.randint(low=18, high=70, size=self.N_people).tolist()
         self.genders = ['m', 'f']
         self.styles = range(N_styles)
 
@@ -38,7 +69,7 @@ class DataMaker:
         company_idx = 0
         while len(self.company_names) < self.N_companies:
             name = self.fake.company()
-            styles = np.random.binomial(1, 0.5, 6)
+            styles = np.random.binomial(1, 0.5, 6).tolist()
             company = Company(name, styles)
             if company.name not in self.company_names:
                 self.companies[company_idx] = company
@@ -53,17 +84,17 @@ class DataMaker:
         for person_idx in range(self.N_people):
                 p_gender = round(np.random.rand())
                 person = Person(self.fake.name(),
-                                self.ages[person_idx],
                                 self.genders[p_gender],
-                                np.random.binomial(1, 0.5, 6)
+                                self.ages[person_idx],
+                                np.random.binomial(1, 0.5, 6).tolist()
                         )
                 self.people[person_idx] = person
 
                 review_idx = self.N_reviews_per_person*person_idx
                 for company_idx in range(self.N_reviews_per_person):
                     company = random.choice(tuple(self.companies))
-                    score = float(np.dot(person.preferences, company.styles)/self.N_styles)
-                    review = Review(person.name, company.name, score)
+                    score = (np.dot(person.preferences, company.styles)/self.N_styles)
+                    review = Review(person, company, score)
                     self.reviews[review_idx+company_idx] = review
         
         self.logger.debug("\tpeople: {}".format(len(self.people)))
@@ -73,13 +104,13 @@ class DataMaker:
         self.logger.debug("Building DataFrames...")
 
         styles_cols = ['P{}'.format(i) for i in range(self.N_styles)]
-        people_df = pd.DataFrame(columns=['Name','Age','Gender']+styles_cols,
+        people_df = pd.DataFrame(columns=['name','gender','age']+styles_cols,
                                 index=list(range(self.N_people))
         )
-        companies_df = pd.DataFrame(columns=['Name']+styles_cols,
+        companies_df = pd.DataFrame(columns=['name']+styles_cols,
                                     index=list(range(self.N_companies))
         )
-        reviews_df = pd.DataFrame(columns=['Name','Company','Score'],
+        reviews_df = pd.DataFrame(columns=['person','company','score'],
                                 index=list(range(self.N_reviews))
         )
 
@@ -91,26 +122,53 @@ class DataMaker:
 
         for company_idx in range(self.N_companies):
             company = self.companies[company_idx]
-            c_props = {'Name':company.name}
+            c_props = {'name':company.name}
             c_props.update(dict(('P{}'.format(p), p) for p in company.styles))
             companies_df.loc[company_idx] = pd.Series(c_props)
 
         for review_idx in range(self.N_reviews):
             review = self.reviews[review_idx]
-            r_props = {'Name':review.name, 'Company':review.company, 'Score':review.score}
+            r_props = {'person':review.name, 'company':review.company, 'score':review.score}
             reviews_df.loc[review_idx] = pd.Series(r_props)
 
         return people_df, companies_df, reviews_df
 
     def load(self):
         self.logger.debug("Loading data sets...")
-        graph = DseGraph("companyReviews", GraphMode.READ_WRITE)
-
-        people = [graph.schema.person().from_dict(person._asdict()) for person in self.people]
-        companies = [graph.schema.company().from_dict(company._asdict()) for company in self.companies]
-        reviews = [graph.schema.review().from_dict(review._asdict()) for review in self.reviews]
         
-        graph.add_person(*people)
-        graph.add_company(*companies)
-        graph.add_review(*reviews)
-                
+        username = self.config['default']['dse']['username']
+        password = self.config['default']['dse']['password']
+        cluster_ip = self.config['default']['dse']['cluster_ip']
+        graph_name = self.config['default']['dse']['graph_name']
+        session = dse_get_session(username=username, password=password, cluster_ip=cluster_ip)
+        self.logger.debug("Creating graph...")
+        create_graph(g=session, graph_name=graph_name)
+
+        g = dse_get_session(username=username, password=password, cluster_ip=cluster_ip, graph_name=graph_name)
+        self.logger.debug("Creating schema...")
+        create_schema(g=g, graph_name=graph_name)
+
+        self.logger.debug("Uploading people...")
+        pb = ProgressBar(max_value=self.N_people)
+        pb.start()
+        for i, person in enumerate(self.people):
+            add_person_query(g, person)
+            pb.update(i+1)
+        pb.finish
+
+        self.logger.debug("Uploading companies...")
+        pb = ProgressBar(max_value=self.N_companies)
+        pb.start()
+        for i, company in enumerate(self.companies):
+            add_company_query(g, company)
+            pb.update(i+1)
+        pb.finish
+
+        self.logger.debug("Uploading reviews...")
+        pb = ProgressBar(max_value=self.N_reviews)
+        pb.start()
+        for i, review in enumerate(self.reviews):
+            add_review_query(g, review)
+            pb.update(i+1)
+        pb.finish
+

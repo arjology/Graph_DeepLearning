@@ -6,6 +6,7 @@ import logging
 import os
 from copy import copy as make_copy
 import numpy as np
+from argparse import ArgumentTypeError as err
 
 # -------------------------------------------------------------------------------------------------
 # Logging
@@ -74,7 +75,7 @@ DEFAULT_REGION = None
 
 DEFAULT_NOT_SET = "DEFAULT_NOT_SET"   
 
-RESOURCES_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '.', 'resources'))
+RESOURCES_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'resources'))
 
 
 def default_config(parent: Path, name: str) -> ConfigTree:
@@ -83,7 +84,7 @@ def default_config(parent: Path, name: str) -> ConfigTree:
         parent = Path(parent)
     dflt_config = ConfigFactory.parse_file(str(parent.joinpath(name)))
     user_config = ConfigTree()
-    if not arg_to_bool(os.environ.get("SCAPE_IGNORE_USER_CONFIG", False)):
+    if not arg_to_bool(os.environ.get("IGNORE_USER_CONFIG", False)):
         user_config_path = Path.home().joinpath("." + name)
         if user_config_path.exists():  # pylint: disable=E1101
             user_config = ConfigFactory.parse_file(str(user_config_path))
@@ -102,259 +103,63 @@ def load_default_config(path: Union[Path, str]=None):
 # Load default configuration, sets global constants declared above
 load_default_config()
 
-
 # -------------------------------------------------------------------------------------------------
-# Data store enumration
+# With this PathType class, you can simply specify the following argument type to match only an 
+# existing directory--anything else will give an error message:
 
-class DataStore(Enum):
-    """Supported database backends."""
+class PathType(object):
+    def __init__(self, exists=True, type='file', dash_ok=True):
+        '''exists:
+                True: a path that does exist
+                False: a path that does not exist, in a valid parent directory
+                None: don't care
+           type: file, dir, symlink, None, or a function returning True for valid paths
+                None: don't care
+           dash_ok: whether to allow "-" as stdin/stdout'''
 
-    UNKNOWN = -1      # Unknown/invalid backend
-    DEFAULT = 0       # Default database backend
+        assert exists in (True, False, None)
+        assert type in ('file','dir','symlink',None) or hasattr(type,'__call__')
 
-    DSE = 30          # Datastax enterprise server
+        self._exists = exists
+        self._type = type
+        self._dash_ok = dash_ok
 
-    @classmethod
-    def from_str(cls, value: str) -> Enum:
-        """Map string to enumeration value."""
-        if value == "DSE":
-            return cls.DSE
-        if value == "DEFAULT":
-            return cls.DEFAULT
-        return cls.UNKNOWN
-
-    @classmethod
-    def from_arg(cls, value: Union[Enum, str]):
-        """From function argument."""
-        if isinstance(value, str):
-            backend = cls.from_str(value)
-        elif isinstance(value, cls):
-            backend = value
+    def __call__(self, string):
+        if string=='-':
+            # the special argument "-" means sys.std{in,out}
+            if self._type == 'dir':
+                raise err('standard input/output (-) not allowed as directory path')
+            elif self._type == 'symlink':
+                raise err('standard input/output (-) not allowed as symlink path')
+            elif not self._dash_ok:
+                raise err('standard input/output (-) not allowed')
         else:
-            raise TypeError("Invalid database/storage backend")
-        return backend
+            e = os.path.exists(string)
+            if self._exists==True:
+                if not e:
+                    raise err("path does not exist: '%s'" % string)
 
+                if self._type is None:
+                    pass
+                elif self._type=='file':
+                    if not os.path.isfile(string):
+                        raise err("path is not a file: '%s'" % string)
+                elif self._type=='symlink':
+                    if not os.path.symlink(string):
+                        raise err("path is not a symlink: '%s'" % string)
+                elif self._type=='dir':
+                    if not os.path.isdir(string):
+                        raise err("path is not a directory: '%s'" % string)
+                elif not self._type(string):
+                    raise err("path not valid: '%s'" % string)
+            else:
+                if self._exists==False and e:
+                    raise err("path exists: '%s'" % string)
 
-# -------------------------------------------------------------------------------------------------
-# Configuration classes
+                p = os.path.dirname(os.path.normpath(string)) or '.'
+                if not os.path.isdir(p):
+                    raise err("parent path is not a directory: '%s'" % p)
+                elif not os.path.exists(p):
+                    raise err("parent directory does not exist: '%s'" % p)
 
-class BaseConfig(object):
-    """Base class of module configurations."""
-
-    GROUP = ""
-
-    __slots__ = [
-        "log_level",  # Logging level of this component.
-        "verbosity"   # Verbosity of logging messages.
-    ]
-
-    _default = dict()
-
-    @classmethod
-    def default(cls):
-        """Get global configuration."""
-        if cls not in BaseConfig._default:
-            BaseConfig._default[cls] = cls()
-        return BaseConfig._default[cls]
-
-    def slots(self):
-        """Get all __slots__ of this object."""
-        return [name for slots in [getattr(cls, '__slots__', []) for cls in type(self).__mro__] for name in slots]
-
-    def __init__(self, config: ConfigTree=None, group: str=None, log_level: Union[int, str]=None, verbosity: int=None):
-        """Set common configuration entries."""
-        for name in self.slots():
-            setattr(self, name, None)
-        self.log_level = logging.getLogger().level
-        self.verbosity = 1
-        BaseConfig.__update(self, config, group=group)
-        BaseConfig.__update(self, config, group="default")
-        self.log_level = to_log_level(select(log_level, self.log_level))
-        self.verbosity = select(verbosity, self.verbosity)
-
-    def __update(self, config: ConfigTree, group: str):
-        """Update entries of **this** class only from given ConfigTree."""
-        self.log_level = to_log_level(self._get(
-            config=config, group=group, key="log_level", default=self.log_level, inherit=True
-        ))
-        self.verbosity = self._get_int(
-            config=config, group=group, key="verbosity", default=self.verbosity, inherit=True
-        )
-
-    def update(self, config: ConfigTree, group: str=None):
-        """Update configuration entries from given ConfigTree."""
-        BaseConfig.__update(self, config, group)
-
-    def copy(self):
-        """Make a copy of this configuration."""
-        config = make_copy(self)
-        for name in self.slots():
-            value = getattr(config, name)
-            if isinstance(value, (list, tuple, dict)):
-                setattr(config, name, make_copy(value))
-        return config
-
-    @staticmethod
-    def _join(*args: str) -> str:
-        """Join parts of configuration key, ignoring empty parts."""
-        key = ''
-        for arg in args:
-            if arg.startswith("."):
-                arg = arg[1:]
-                key = ''
-            if arg:
-                if key:
-                    key += '.'
-                key += arg
-        return key
-
-    @staticmethod
-    def _envvar(key: str) -> str:
-        """Get name of environment variable from configuration entry key."""
-        return "SCAPE_" + key.replace(".", "_").upper()
-
-    @staticmethod
-    def _parent(key: str) -> str:
-        """Get parent group of configuration key."""
-        return ".".join(key.split(".")[0:-1])
-
-    @classmethod
-    def _get(cls, key: Union[str, Iterable[str]], default: object=DEFAULT_NOT_SET,
-             group: str=None, config: ConfigTree=None, inherit: bool=False, envvar: str=None) -> object:
-        # too many branches: pylint: disable=R0912
-        """Get value from default configuration using the specified getter."""
-        config = select(config, DEFAULT_CONFIG)
-        group = select(group, cls.GROUP)
-        if isinstance(key, str):
-            key = [key]
-        value = None
-        for name in key:
-            config_key = cls._join(group, name)
-            # 1. Consider environment variable
-            if envvar != '':
-                value = os.environ.get(select(envvar, cls._envvar(config_key)), None)
-                if value is not None:
-                    break
-            # 2. Consider configuration entry of DEFAULT_CONFIG
-            value = config.get(config_key, None)
-            if value is not None:
-                break
-            # 3. Consider environment variables and/or configuration entries of parent group
-            if inherit and value is None:
-                parent_group = cls._parent(group)
-                default_keys = [
-                    cls._join(parent_group, name),
-                    cls._join(parent_group, "default", name),
-                    cls._join("default", group, name)
-                ]
-                if envvar != '':
-                    for default_key in default_keys:
-                        value = os.environ.get(cls._envvar(default_key), None)
-                        if value is not None:
-                            break
-                if value is None:
-                    for default_key in default_keys:
-                        value = config.get(default_key, None)
-                        if value is not None:
-                            break
-        # 4. Use hard-coded default value if specified (prefer to specify in DEFAULT_CONFIG)
-        value = select(value, default)
-        if value == DEFAULT_NOT_SET:
-            raise KeyError("Missing configuration value for: " + repr([cls._join(group, name) for name in key]))
-        return value
-
-    @classmethod
-    def _get_config(cls, key: Union[str, Iterable[str]], default: str=DEFAULT_NOT_SET,
-                    group: str=None, config: ConfigTree=None, inherit: bool=False) -> str:
-        """Get value from default configuration."""
-        value = cls._get(config=config, group=group, key=key, default=default, inherit=inherit)
-        if not isinstance(value, ConfigTree):
-            raise ValueError("Entry group={} key={} must be a dictionary (ConfigTree)".format(group, key))
-        return value
-
-    @classmethod
-    def _get_bool(cls, key: Union[str, Iterable[str]], default: bool=DEFAULT_NOT_SET,
-                  group: str=None, config: ConfigTree=None, inherit: bool=False) -> bool:
-        """Get value from default configuration."""
-        return arg_to_bool(cls._get(config=config, group=group, key=key, default=default, inherit=inherit))
-
-    @classmethod
-    def _get_int(cls, key: Union[str, Iterable[str]], default: int=DEFAULT_NOT_SET,
-                 group: str=None, config: ConfigTree=None, inherit: bool=False) -> int:
-        """Get value from default configuration."""
-        return int(cls._get(config=config, group=group, key=key, default=default, inherit=inherit))
-
-    @classmethod
-    def _get_float(cls, key: Union[str, Iterable[str]], default: float=DEFAULT_NOT_SET,
-                   group: str=None, config: ConfigTree=None, inherit: bool=False) -> float:
-        """Get value from default configuration."""
-        return float(cls._get(config=config, group=group, key=key, default=default, inherit=inherit))
-
-    @classmethod
-    def _get_string(cls, key: Union[str, Iterable[str]], default: str=DEFAULT_NOT_SET,
-                    group: str=None, config: ConfigTree=None, inherit: bool=False) -> str:
-        """Get value from default configuration."""
-        return str(cls._get(config=config, group=group, key=key, default=default, inherit=inherit))
-
-    @classmethod
-    def _get_list(cls, key: Union[str, Iterable[str]], default: list=DEFAULT_NOT_SET,
-                  group: str=None, config: ConfigTree=None, inherit: bool=False) -> list:
-        """Get value from default configuration."""
-        value = cls._get(config=config, group=group, key=key, default=default, inherit=inherit)
-        if isinstance(value, str):
-            value = value.strip()
-            if not value.startswith("[") or not value.endswith("]"):
-                config_key = ' or '.join([cls._join(group, k) for k in key])
-                raise ValueError("Value of {} must be comma-separated list".format(config_key))
-            value = [item.strip() for item in value.split(",")]
-        elif not isinstance(value, list):
-            config_key = cls._join(group, key)
-            raise ValueError("Value of {} must be list or string".format(config_key))
-        return value
-
-    def __getitem__(self, name: str) -> object:
-        """Get named configuration entry."""
-        obj = self
-        for part in name.split("."):
-            try:
-                obj = getattr(obj, part)
-            except AttributeError:
-                raise KeyError("Invalid attribute: " + name)
-        return obj
-
-    def __setitem__(self, name: str, value: object):
-        """Set named configuration entry."""
-        obj = self
-        parts = name.split(".")
-        for part in parts[0:-1]:
-            try:
-                obj = getattr(obj, part)
-            except AttributeError:
-                raise KeyError("Invalid attribute: " + name)
-        try:
-            setattr(obj, parts[-1], value)
-        except AttributeError:
-            raise KeyError("Invalid attribute: " + name)
-
-    def __repr__(self) -> str:
-        """Convert to string representation."""
-        s = type(self).__name__
-        s += "("
-        for i, slot in enumerate(self.slots()):
-            if i > 0:
-                s += ", "
-            s += slot
-            s += "="
-            s += repr(getattr(self, slot))
-        s += ")"
-        return s
-
-    def __eq__(self, other):
-        """Compare configurations."""
-        if not isinstance(other, self.__class__):
-            return False
-        for slot in self.slots():
-            if getattr(self, slot) != getattr(other, slot):
-                return False
-        return True    
-
+        return string
